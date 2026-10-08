@@ -7,6 +7,8 @@ import csv
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import aiosqlite
+
 from amap_accessibility_common import default_service_date, load_amap_credentials, load_env_file, normalize_text
 from metro_accessibility_common import (
     METRO_POI_TYPECODE,
@@ -14,6 +16,7 @@ from metro_accessibility_common import (
     MetroAMapClient,
     Station,
     StationResolveRules,
+    build_station_id,
     crawl_routes,
     dedupe_strings,
     init_db,
@@ -47,22 +50,23 @@ def line_label_for_order(line_order: int) -> str:
 
 def load_station_catalog_from_csv(csv_path: Path) -> List[Station]:
     stations: List[Station] = []
-    with csv_path.open("r", newline="", encoding="utf-8") as handle:
+    with csv_path.open("r", newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         fieldnames = set(reader.fieldnames or [])
 
         if {"line", "station_id", "station_name"}.issubset(fieldnames):
             for row in reader:
-                station_id = row["station_id"]
+                legacy_id = row["station_id"]
                 line_order = int(row["line"])
+                station_name = row["station_name"]
                 stations.append(
                     Station(
-                        station_id=station_id,
-                        station_slug=station_id,
-                        station_name=row["station_name"],
+                        station_id=build_station_id(line_order, station_name),
+                        station_slug=station_name,
+                        station_name=station_name,
                         line_order=line_order,
                         line_label=line_label_for_order(line_order),
-                        source_key=station_id,
+                        source_key=legacy_id,
                     )
                 )
             return stations
@@ -82,6 +86,45 @@ def load_station_catalog_from_csv(csv_path: Path) -> List[Station]:
             return stations
 
     raise RuntimeError(f"Unsupported station CSV format: {csv_path}")
+
+
+async def migrate_numeric_station_ids(conn: aiosqlite.Connection, stations: Sequence[Station]) -> int:
+    """把旧版数字 station_id（如 0123）迁移到统一的 `线序-站名` 格式，保留已爬数据。"""
+    migrations: List[Tuple[str, str]] = []
+    for station in stations:
+        old_id = station.source_key
+        if not old_id.isdigit() or old_id == station.station_id:
+            continue
+        cursor = await conn.execute("SELECT 1 FROM station_amap WHERE station_id = ? LIMIT 1", (old_id,))
+        old_exists = await cursor.fetchone() is not None
+        await cursor.close()
+        if not old_exists:
+            continue
+        cursor = await conn.execute("SELECT 1 FROM station_amap WHERE station_id = ? LIMIT 1", (station.station_id,))
+        new_exists = await cursor.fetchone() is not None
+        await cursor.close()
+        if new_exists:
+            print(f"Skipping id migration for {old_id} -> {station.station_id}: target id already exists.")
+            continue
+        migrations.append((old_id, station.station_id))
+
+    if not migrations:
+        return 0
+
+    await conn.execute("BEGIN IMMEDIATE")
+    try:
+        for old_id, new_id in migrations:
+            await conn.execute("UPDATE station_amap SET station_id = ? WHERE station_id = ?", (new_id, old_id))
+            # OR IGNORE keeps an already-existing new-format route row and leaves the
+            # conflicting old-format row untouched; the DELETE below drops those leftovers.
+            await conn.execute("UPDATE OR IGNORE route_times SET from_id = ? WHERE from_id = ?", (new_id, old_id))
+            await conn.execute("UPDATE OR IGNORE route_times SET to_id = ? WHERE to_id = ?", (new_id, old_id))
+            await conn.execute("DELETE FROM route_times WHERE from_id = ? OR to_id = ?", (old_id, old_id))
+        await conn.execute("COMMIT")
+    except Exception:
+        await conn.execute("ROLLBACK")
+        raise
+    return len(migrations)
 
 
 def write_station_catalog_csv(stations: Sequence[Station], output_dir: Path) -> None:
@@ -215,6 +258,9 @@ async def main() -> None:
         stations_csv = Path(args.stations_csv)
         if stations_csv.exists():
             stations = load_station_catalog_from_csv(stations_csv)
+            migrated = await migrate_numeric_station_ids(conn, stations)
+            if migrated:
+                print(f"Migrated {migrated} legacy numeric station ids to the unified format.")
             await sync_station_catalog(conn, stations)
         else:
             catalog = await load_station_catalog_with_source(conn)

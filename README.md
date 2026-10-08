@@ -140,6 +140,19 @@ converter:
 - `rows/<g>.json` — `{"t": {dest_group_id: minutes}}` per origin group;
   minutes are integers, the minimum over member-node pairs, `status=done` only.
 
+Station ids use the form `线序-名称标识`, but the exact format differs by
+catalog source:
+
+- Shanghai CSV catalog: `线号-中文站名` (for example `02-中山公园`). Shanghai
+  legacy numeric ids (for example `0201`) are migrated automatically on the
+  next run, preserving resolved POIs and crawled routes.
+- MetroMan HTML catalogs (all other cities): `页面section序号-拼音slug` (for
+  example `01-yannei`). The numeric prefix is the line-group order on the
+  source page, **not** the line number — for example Xiamen Line 6 is the 5th
+  section, so its ids start with `05-`. If the upstream page reorders sections
+  or renames a station slug, ids drift and the affected stations are re-resolved
+  and re-crawled from scratch on the next run.
+
 ## Notes
 
 - The route matrix is directional because entrances, walking time, and service patterns can differ by direction.
@@ -213,6 +226,7 @@ Default Wuhan outputs:
 - `output/wuhan/travel_time_pairs.md`
 - `output/wuhan/average_time_ranking.csv`
 - `output/wuhan/average_time_ranking.md`
+
 ## Xiamen Variant
 
 The repository now also includes `xmmetro_accessibility.py` for Xiamen. The station list comes from `厦门地铁车站列表 - 地铁通 MetroMan.html` (saved from https://www.metroman.cn/cities/xiamen/stations).
@@ -237,5 +251,6 @@ Default Xiamen outputs:
 - `output/xiamen/travel_time_pairs.md`
 - `output/xiamen/average_time_ranking.csv`
 - `output/xiamen/average_time_ranking.md`
+- `output/xiamen/frontend/`
 
 Note: the MetroMan catalog may include lines that are not open yet (for example Line 4). Stations that AMap cannot match stay `unresolved` and their routes are left blank until the line opens and a rerun resolves them.
