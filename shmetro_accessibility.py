@@ -7,6 +7,8 @@ import csv
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import aiosqlite
+
 from amap_accessibility_common import default_service_date, load_amap_credentials, load_env_file, normalize_text
 from metro_accessibility_common import (
     METRO_POI_TYPECODE,
@@ -14,15 +16,18 @@ from metro_accessibility_common import (
     MetroAMapClient,
     Station,
     StationResolveRules,
+    build_station_id,
     crawl_routes,
     dedupe_strings,
     init_db,
     load_resolved_stations,
     load_route_results,
     load_station_catalog_with_source,
+    resolve_scope_from_args,
     resolve_stations,
     sync_station_catalog,
     write_average_ranking,
+    write_frontend_json,
     write_route_outputs,
     write_station_resolution,
 )
@@ -45,22 +50,23 @@ def line_label_for_order(line_order: int) -> str:
 
 def load_station_catalog_from_csv(csv_path: Path) -> List[Station]:
     stations: List[Station] = []
-    with csv_path.open("r", newline="", encoding="utf-8") as handle:
+    with csv_path.open("r", newline="", encoding="utf-8-sig") as handle:
         reader = csv.DictReader(handle)
         fieldnames = set(reader.fieldnames or [])
 
         if {"line", "station_id", "station_name"}.issubset(fieldnames):
             for row in reader:
-                station_id = row["station_id"]
+                legacy_id = row["station_id"]
                 line_order = int(row["line"])
+                station_name = row["station_name"]
                 stations.append(
                     Station(
-                        station_id=station_id,
-                        station_slug=station_id,
-                        station_name=row["station_name"],
+                        station_id=build_station_id(line_order, station_name),
+                        station_slug=station_name,
+                        station_name=station_name,
                         line_order=line_order,
                         line_label=line_label_for_order(line_order),
-                        source_key=station_id,
+                        source_key=legacy_id,
                     )
                 )
             return stations
@@ -80,6 +86,45 @@ def load_station_catalog_from_csv(csv_path: Path) -> List[Station]:
             return stations
 
     raise RuntimeError(f"Unsupported station CSV format: {csv_path}")
+
+
+async def migrate_numeric_station_ids(conn: aiosqlite.Connection, stations: Sequence[Station]) -> int:
+    """把旧版数字 station_id（如 0123）迁移到统一的 `线序-站名` 格式，保留已爬数据。"""
+    migrations: List[Tuple[str, str]] = []
+    for station in stations:
+        old_id = station.source_key
+        if not old_id.isdigit() or old_id == station.station_id:
+            continue
+        cursor = await conn.execute("SELECT 1 FROM station_amap WHERE station_id = ? LIMIT 1", (old_id,))
+        old_exists = await cursor.fetchone() is not None
+        await cursor.close()
+        if not old_exists:
+            continue
+        cursor = await conn.execute("SELECT 1 FROM station_amap WHERE station_id = ? LIMIT 1", (station.station_id,))
+        new_exists = await cursor.fetchone() is not None
+        await cursor.close()
+        if new_exists:
+            print(f"Skipping id migration for {old_id} -> {station.station_id}: target id already exists.")
+            continue
+        migrations.append((old_id, station.station_id))
+
+    if not migrations:
+        return 0
+
+    await conn.execute("BEGIN IMMEDIATE")
+    try:
+        for old_id, new_id in migrations:
+            await conn.execute("UPDATE station_amap SET station_id = ? WHERE station_id = ?", (new_id, old_id))
+            # OR IGNORE keeps an already-existing new-format route row and leaves the
+            # conflicting old-format row untouched; the DELETE below drops those leftovers.
+            await conn.execute("UPDATE OR IGNORE route_times SET from_id = ? WHERE from_id = ?", (new_id, old_id))
+            await conn.execute("UPDATE OR IGNORE route_times SET to_id = ? WHERE to_id = ?", (new_id, old_id))
+            await conn.execute("DELETE FROM route_times WHERE from_id = ? OR to_id = ?", (old_id, old_id))
+        await conn.execute("COMMIT")
+    except Exception:
+        await conn.execute("ROLLBACK")
+        raise
+    return len(migrations)
 
 
 def write_station_catalog_csv(stations: Sequence[Station], output_dir: Path) -> None:
@@ -174,6 +219,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retries", type=int, default=4, help="Retry count for transient AMap errors")
     parser.add_argument("--resolve-workers", type=int, default=2, help="Concurrent workers for station matching")
     parser.add_argument("--route-workers", type=int, default=6, help="Concurrent workers for route crawling")
+    parser.add_argument(
+        "--lines",
+        default="",
+        help="Comma-separated line labels (e.g. \"2号线,10号线\"); restrict resolving and crawling to these lines",
+    )
+    parser.add_argument(
+        "--from-lines",
+        default="",
+        help="Comma-separated line labels restricting route origins; defaults to --lines when that is set",
+    )
+    parser.add_argument(
+        "--to-lines",
+        default="",
+        help="Comma-separated line labels restricting route destinations; defaults to --lines when that is set",
+    )
     parser.add_argument("--station-search-qps", type=float, default=3.01, help="Hard QPS cap for AMap station search requests")
     parser.add_argument("--route-plan-qps", type=float, default=3.01, help="Hard QPS cap for AMap route planning requests")
     parser.add_argument("--date", default=default_service_date(), help="Service date in YYYY-MM-DD, defaults to a workday")
@@ -198,6 +258,9 @@ async def main() -> None:
         stations_csv = Path(args.stations_csv)
         if stations_csv.exists():
             stations = load_station_catalog_from_csv(stations_csv)
+            migrated = await migrate_numeric_station_ids(conn, stations)
+            if migrated:
+                print(f"Migrated {migrated} legacy numeric station ids to the unified format.")
             await sync_station_catalog(conn, stations)
         else:
             catalog = await load_station_catalog_with_source(conn)
@@ -205,6 +268,13 @@ async def main() -> None:
             print(f"Station CSV not found: {stations_csv}. Loaded {len(stations)} stations from {catalog.source} in {db_path}.")
 
         write_station_catalog_csv(stations, output_dir)
+
+        resolve_ids, from_ids, to_ids = resolve_scope_from_args(args, stations)
+        if resolve_ids is not None:
+            print(f"Line filter active: resolving {len(resolve_ids)} of {len(stations)} stations.")
+        if from_ids is not None or to_ids is not None:
+            scope_desc = f"from {len(from_ids) if from_ids is not None else 'ALL'} origins x to {len(to_ids) if to_ids is not None else 'ALL'} destinations"
+            print(f"Route scope: {scope_desc}.")
 
         resolved = await load_resolved_stations(conn)
         routes = await load_route_results(conn)
@@ -222,7 +292,7 @@ async def main() -> None:
                 search_page_size=10,
             )
 
-            resolved = await resolve_stations(client, conn, stations, workers=args.resolve_workers, rules=RESOLVE_RULES)
+            resolved = await resolve_stations(client, conn, stations, workers=args.resolve_workers, rules=RESOLVE_RULES, only_ids=resolve_ids)
             write_station_resolution(stations, resolved, output_dir)
 
             if not args.resolve_only:
@@ -236,12 +306,25 @@ async def main() -> None:
                     service_time=args.time,
                     strategy=args.strategy,
                     route_city_code=RESOLVE_RULES.route_city_code,
+                    from_ids=from_ids,
+                    to_ids=to_ids,
                 )
 
         write_station_catalog_csv(stations, output_dir)
         write_station_resolution(stations, resolved, output_dir)
         write_route_outputs(stations, routes, output_dir, "Shanghai Metro")
         write_average_ranking(stations, routes, output_dir)
+        frontend_dir = write_frontend_json(
+            stations,
+            resolved,
+            routes,
+            output_dir,
+            "Shanghai Metro",
+            service_date=args.date,
+            service_time=args.time,
+            strategy=args.strategy,
+        )
+        print(f"Frontend JSON written to: {frontend_dir.resolve()}")
     finally:
         if client is not None:
             await client.aclose()
